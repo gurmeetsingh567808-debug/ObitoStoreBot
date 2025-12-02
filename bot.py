@@ -1,419 +1,380 @@
 import os
-import sqlite3
 import asyncio
 import logging
-from time import time
+import sqlite3
 from datetime import datetime
-
-from telegram import Update, Message
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     ContextTypes,
-    filters,
+    filters
 )
 
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
 # CONFIG
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
 
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "YOUR_BOT_TOKEN"
-BOT_USERNAME = os.getenv("BOT_USERNAME") or "YOUR_BOT_USERNAME"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "")
+GROUP_ID = int(os.getenv("GROUP_ID"))
+OWNER_ID = int(os.getenv("OWNER_ID"))
+AUTO_DELETE = int(os.getenv("AUTO_DELETE", "0"))   # optional
 
-GROUP_ID = int(os.getenv("GROUP_ID") or -1001234567890)
-OWNER_ID = int(os.getenv("OWNER_ID") or 123456789)
+DB = "filestore.db"
 
-BACKUP_GROUP_ID = int(os.getenv("BACKUP_GROUP_ID", "0")) or None
-AUTO_DELETE = int(os.getenv("AUTO_DELETE", "18000"))  # 5 hours
+# -------------------------------------------------------------------
+# LOGGING
+# -------------------------------------------------------------------
 
-# Modes
-filestore_mode = {}   # only next file
-batch_mode = {}       # batch list
-
-# Logging
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
+    format="%(asctime)s | %(message)s"
 )
-logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------
-# DATABASE
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
+# DATABASE INIT
+# -------------------------------------------------------------------
 
-db = sqlite3.connect("filestore.db")
-cur = db.cursor()
+con = sqlite3.connect(DB, check_same_thread=False)
+cur = con.cursor()
 
 cur.execute("""
-CREATE TABLE IF NOT EXISTS files(
+CREATE TABLE IF NOT EXISTS files (
     code TEXT PRIMARY KEY,
-    message_id INTEGER,
-    owner INTEGER,
-    created_at INTEGER
+    user_id INTEGER,
+    msg_id INTEGER,
+    caption TEXT,
+    stored_at INTEGER
 )
 """)
 
 cur.execute("""
-CREATE TABLE IF NOT EXISTS batches(
-    code TEXT PRIMARY KEY,
-    owner INTEGER,
-    created_at INTEGER
-)
-""")
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS items(
+CREATE TABLE IF NOT EXISTS batches (
+    user_id INTEGER,
     code TEXT,
-    message_id INTEGER,
-    owner INTEGER
+    msg_id INTEGER
 )
 """)
 
 cur.execute("""
-CREATE TABLE IF NOT EXISTS admins(
-    id INTEGER PRIMARY KEY
+CREATE TABLE IF NOT EXISTS admins (
+    user_id INTEGER PRIMARY KEY
 )
 """)
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS meta(
-    k TEXT PRIMARY KEY,
-    v TEXT
-)
-""")
+# add owner as default admin
+cur.execute("INSERT OR IGNORE INTO admins(user_id) VALUES(?)", (OWNER_ID,))
+con.commit()
 
-db.commit()
+# -------------------------------------------------------------------
+# HELPER FUNCTIONS
+# -------------------------------------------------------------------
 
-cur.execute("INSERT OR IGNORE INTO admins VALUES (?)", (OWNER_ID,))
-db.commit()
+def gen_code():
+    import random, string
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
-# ---------------------------------------------------------
-# UTILITY FUNCTIONS
-# ---------------------------------------------------------
 
-def is_admin(uid):
-    row = cur.execute("SELECT id FROM admins WHERE id=?", (uid,)).fetchone()
+def is_admin(uid: int):
+    row = cur.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)).fetchone()
     return bool(row)
 
 
-def gen_code(l=8):
-    import random, string
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=l))
+async def forward_safely(app, chat_id, msg):
+    """
+    Forwards EXACT original file with caption.
+    """
+    await asyncio.sleep(1.5)   # flood control delay
+
+    if msg.photo:
+        return await app.bot.send_photo(
+            chat_id,
+            msg.photo[-1].file_id,
+            caption=msg.caption or ""
+        )
+    elif msg.video:
+        return await app.bot.send_video(
+            chat_id,
+            msg.video.file_id,
+            caption=msg.caption or ""
+        )
+    elif msg.document:
+        return await app.bot.send_document(
+            chat_id,
+            msg.document.file_id,
+            caption=msg.caption or ""
+        )
+    elif msg.animation:
+        return await app.bot.send_animation(
+            chat_id,
+            msg.animation.file_id,
+            caption=msg.caption or ""
+        )
+    elif msg.sticker:
+        return await app.bot.send_sticker(
+            chat_id,
+            msg.sticker.file_id
+        )
+    else:
+        # text
+        return await app.bot.send_message(chat_id, msg.text)
 
 
-async def safe_forward(msg, target, retries=3):
-    for _ in range(retries):
+# -------------------------------------------------------------------
+# COMMANDS
+# -------------------------------------------------------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    args = context.args
+
+    if args:
+        # deep link restore
+        code = args[0]
+        row = cur.execute("SELECT msg_id FROM files WHERE code=?", (code,)).fetchone()
+        if not row:
+            return await update.message.reply_text("❌ Invalid or expired link.")
+
+        msg_id = row[0]
         try:
-            forwarded = await msg.forward(target)
-            return forwarded.message_id
+            original = await context.bot.forward_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=GROUP_ID,
+                message_id=msg_id
+            )
         except:
-            await asyncio.sleep(0.5)
-    return None
+            return await update.message.reply_text("❌ File not found in storage.")
 
-
-async def restore_message(context, chat_id, message_id):
-    try:
-        await context.bot.forward_message(chat_id, GROUP_ID, message_id)
-        return True
-    except:
-        return False
-# ---------------------------------------------------------
-# COMMAND HANDLERS
-# ---------------------------------------------------------
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text or ""
-    if " " in txt:
-        code = txt.split(" ", 1)[1].strip()
-        return await handle_restore_request(update, context, code)
+        return
 
     await update.message.reply_text(
-        "Welcome!\n"
-        "Use /help to see commands."
+        "👋 Welcome!\nSend /filestore to store the next file.\nAdmins can use batch mode."
     )
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Commands:\n"
-        "filestore – store next file only\n"
-        "myfiles – list stored files\n"
-        "setcode – rename last code\n"
-        "batch – start silent batch (admin)\n"
-        "batchdone – finish batch\n"
-        "stats – admin only\n"
-        "adminlist – show admins\n"
-        "addadmin – owner only\n"
-        "removeadmin – owner only\n"
+        "**Available Commands:**\n\n"
+        "filestore – Store next file only\n"
+        "myfiles – Show stored files\n"
+        "setcode – Rename last stored file\n\n"
+        "**Admin Commands:**\n"
+        "batch – Start silent batch\n"
+        "batchdone – Finish batch\n"
+        "adminlist – Show admins\n"
+        "addadmin – Add admin (owner only)\n"
+        "removeadmin – Remove admin (owner only)",
+        parse_mode="Markdown"
     )
 
 
-async def cmd_filestore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===================================================================
+# FILERESTORE (Single file)
+# ===================================================================
+
+pending_single = {}   # user_id → True
+last_stored = {}      # user_id → code
+
+
+async def filestore(update: Update, context):
     uid = update.effective_user.id
-    filestore_mode[uid] = True
-    await update.message.reply_text("Send the file you want to store (one file).")
+    pending_single[uid] = True
+    await update.message.reply_text("📥 Send the file you want to store.")
 
 
-async def cmd_myfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def single_file_handler(update: Update, context):
+    uid = update.effective_user.id
+
+    if uid not in pending_single:
+        return
+
+    msg = update.message
+    code = gen_code()
+
+    # forward to GROUP
+    forwarded = await forward_safely(context.application, GROUP_ID, msg)
+
+    cur.execute(
+        "INSERT INTO files(code, user_id, msg_id, caption, stored_at) VALUES(?,?,?,?,?)",
+        (code, uid, forwarded.message_id, msg.caption or "", int(datetime.now().timestamp()))
+    )
+    con.commit()
+
+    del pending_single[uid]
+    last_stored[uid] = code
+
+    link = f"https://t.me/{BOT_USERNAME}?start={code}"
+
+    await update.message.reply_text(f"✅ File stored!\n🔗 {link}")
+
+
+async def myfiles(update, context):
     uid = update.effective_user.id
     rows = cur.execute(
-        "SELECT code, created_at FROM files WHERE owner=? ORDER BY created_at DESC LIMIT 100",
-        (uid,)
+        "SELECT code FROM files WHERE user_id=?", (uid,)
     ).fetchall()
 
     if not rows:
-        return await update.message.reply_text("You have no stored files.")
+        return await update.message.reply_text("❌ You have no stored files.")
 
-    out = []
-    for code, ts in rows:
-        dt = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-        out.append(f"{code}\nhttps://t.me/{BOT_USERNAME}?start={code}")
-
-    await update.message.reply_text("\n\n".join(out))
+    txt = "📦 **Your Files:**\n\n" + "\n".join([row[0] for row in rows])
+    await update.message.reply_text(txt, parse_mode="Markdown")
 
 
-async def cmd_setcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def setcode(update, context):
     uid = update.effective_user.id
+    if uid not in last_stored:
+        return await update.message.reply_text("❌ No recent stored file.")
+
     if not context.args:
-        return await update.message.reply_text("Usage: setcode NEWCODE")
+        return await update.message.reply_text("❌ Provide a new code.")
 
-    new_code = context.args[0].strip()
+    new = context.args[0]
+    old = last_stored[uid]
 
-    exists = cur.execute("SELECT 1 FROM files WHERE code=?", (new_code,)).fetchone()
-    exists2 = cur.execute("SELECT 1 FROM batches WHERE code=?", (new_code,)).fetchone()
+    cur.execute("UPDATE files SET code=? WHERE code=?", (new, old))
+    con.commit()
 
-    if exists or exists2:
-        return await update.message.reply_text("Code already exists.")
+    last_stored[uid] = new
 
-    row = cur.execute(
-        "SELECT code FROM files WHERE owner=? ORDER BY created_at DESC LIMIT 1",
-        (uid,)
-    ).fetchone()
-
-    if not row:
-        return await update.message.reply_text("No recent file.")
-
-    old = row[0]
-    cur.execute("UPDATE files SET code=? WHERE code=?", (new_code, old))
-    db.commit()
-
-    await update.message.reply_text(
-        f"Code updated:\nhttps://t.me/{BOT_USERNAME}?start={new_code}"
-    )
+    await update.message.reply_text(f"✅ Code updated: `{new}`", parse_mode="Markdown")
 
 
-async def cmd_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===================================================================
+# BATCH MODE
+# ===================================================================
+
+batch_mode = {}   # uid → True
+batch_files = {}  # uid → list of message_ids
+
+
+async def batch(update, context):
     uid = update.effective_user.id
     if not is_admin(uid):
-        return await update.message.reply_text("Admins only.")
-    batch_mode[uid] = []
+        return await update.message.reply_text("❌ Admin only.")
+
+    batch_mode[uid] = True
+    batch_files[uid] = []
+    await update.message.reply_text("📦 Batch mode started.\nSend files silently.")
 
 
-async def cmd_batchdone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def batch_handler(update: Update, context):
     uid = update.effective_user.id
-
-    if not is_admin(uid):
-        return await update.message.reply_text("Admins only.")
-
     if uid not in batch_mode:
-        return await update.message.reply_text("No active batch.")
+        return
 
-    items = batch_mode.pop(uid)
+    msg = update.message
+    forwarded = await forward_safely(context.application, GROUP_ID, msg)
 
-    if not items:
-        return await update.message.reply_text("Batch is empty.")
+    batch_files[uid].append(forwarded.message_id)
+
+
+async def batchdone(update, context):
+    uid = update.effective_user.id
+    if uid not in batch_mode:
+        return await update.message.reply_text("❌ You are not in batch mode.")
+
+    msgs = batch_files.get(uid, [])
+    if not msgs:
+        return await update.message.reply_text("❌ Batch empty.")
 
     code = gen_code()
-
-    cur.execute("INSERT INTO batches VALUES (?,?,?)", (code, uid, int(time())))
-    db.commit()
-
-    for mid in items:
-        cur.execute("INSERT INTO items VALUES (?,?,?)", (code, mid, uid))
-    db.commit()
-
-    await update.message.reply_text(
-        f"Batch saved!\nhttps://t.me/{BOT_USERNAME}?start={code}"
+    # we store only FIRST message id (entry point)
+    cur.execute(
+        "INSERT INTO files(code, user_id, msg_id, caption, stored_at) VALUES(?,?,?,?,?)",
+        (code, uid, msgs[0], "", int(datetime.now().timestamp()))
     )
+    con.commit()
+
+    del batch_mode[uid]
+    del batch_files[uid]
+
+    link = f"https://t.me/{BOT_USERNAME}?start={code}"
+    await update.message.reply_text(f"✅ Batch stored!\n🔗 {link}")
 
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return await update.message.reply_text("Admins only.")
+# ===================================================================
+# ADMIN SYSTEM
+# ===================================================================
 
-    f = cur.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-    b = cur.execute("SELECT COUNT(*) FROM batches").fetchone()[0]
-    i = cur.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-
-    await update.message.reply_text(
-        f"Files: {f}\nBatches: {b}\nItems: {i}"
-    )
+async def adminlist(update, context):
+    rows = cur.execute("SELECT user_id FROM admins").fetchall()
+    txt = "**Admins:**\n" + "\n".join([str(r[0]) for r in rows])
+    await update.message.reply_text(txt, parse_mode="Markdown")
 
 
-async def cmd_adminlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = cur.execute("SELECT id FROM admins").fetchall()
-    out = "Admins:\n" + "\n".join(str(r[0]) for r in rows)
-    await update.message.reply_text(out)
+async def addadmin(update, context):
+    uid = update.effective_user.id
+    if uid != OWNER_ID:
+        return await update.message.reply_text("❌ Owner only.")
+
+    if not context.args:
+        return await update.message.reply_text("Send user ID.")
+
+    new = int(context.args[0])
+    cur.execute("INSERT OR IGNORE INTO admins(user_id) VALUES(?)", (new,))
+    con.commit()
+
+    await update.message.reply_text("✅ Admin added.")
 
 
-async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return
-    uid = int(context.args[0])
-    cur.execute("INSERT OR IGNORE INTO admins VALUES(?)", (uid,))
-    db.commit()
-    await update.message.reply_text("Admin added.")
+async def removeadmin(update, context):
+    uid = update.effective_user.id
+    if uid != OWNER_ID:
+        return await update.message.reply_text("❌ Owner only.")
+
+    if not context.args:
+        return await update.message.reply_text("Send user ID.")
+
+    rem = int(context.args[0])
+    cur.execute("DELETE FROM admins WHERE user_id=?", (rem,))
+    con.commit()
+
+    await update.message.reply_text("❌ Admin removed.")
 
 
-async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return
-    uid = int(context.args[0])
-    cur.execute("DELETE FROM admins WHERE id=?", (uid,))
-    db.commit()
-    await update.message.reply_text("Admin removed.")
+# ===================================================================
+# MESSAGE ROUTER
+# ===================================================================
 
+async def message_handler(update: Update, context):
+    uid = update.effective_user.id
 
-# ---------------------------------------------------------
-# MESSAGE HANDLER
-# ---------------------------------------------------------
+    # single store
+    if uid in pending_single:
+        return await single_file_handler(update, context)
 
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg:
-        return
-
-    uid = msg.from_user.id
-
-    if msg.text and msg.text.startswith("/"):
-        return
-
-    # filestore mode (store only next file)
-    if uid in filestore_mode:
-        filestore_mode.pop(uid, None)
-        mid = await safe_forward(msg, GROUP_ID)
-
-        if not mid:
-            return await update.message.reply_text("Failed to store file.")
-
-        code = gen_code()
-        cur.execute("INSERT INTO files VALUES (?,?,?,?)",
-                    (code, mid, uid, int(time())))
-        db.commit()
-
-        return await update.message.reply_text(
-            f"Stored!\nhttps://t.me/{BOT_USERNAME}?start={code}"
-        )
-
-    # silent batch mode
+    # batch
     if uid in batch_mode:
-        mid = await safe_forward(msg, GROUP_ID)
-        if mid:
-            batch_mode[uid].append(mid)
-        return
-
-    # normal mode = ignore
-    return
-# ---------------------------------------------------------
-# RESTORE SYSTEM
-# ---------------------------------------------------------
-
-async def handle_restore_request(update: Update, context, code: str):
-    chat_id = update.message.chat.id
-
-    row = cur.execute("SELECT message_id FROM files WHERE code=?", (code,)).fetchone()
-    if row:
-        mid = row[0]
-        ok = await restore_message(context, chat_id, mid)
-        if ok:
-            return await update.message.reply_text("Here is your file.")
-        return await update.message.reply_text("Failed to restore.")
-    
-    items = cur.execute(
-        "SELECT message_id FROM items WHERE code=? ORDER BY rowid ASC",
-        (code,)
-    ).fetchall()
-
-    if items:
-        await update.message.reply_text(f"Sending {len(items)} files…")
-        for (mid,) in items:
-            await restore_message(context, chat_id, mid)
-            await asyncio.sleep(1.5)
-        return
-
-    await update.message.reply_text("Invalid or expired link.")
+        return await batch_handler(update, context)
 
 
-# ---------------------------------------------------------
-# AUTO DELETE LOOP
-# ---------------------------------------------------------
-
-async def auto_delete_loop(app):
-    while True:
-        row = cur.execute("SELECT v FROM meta WHERE k='auto_delete_enabled'").fetchone()
-        if not row or row[0] == "0":
-            await asyncio.sleep(10)
-            continue
-
-        delay = int(cur.execute(
-            "SELECT v FROM meta WHERE k='auto_delete_seconds'"
-        ).fetchone()[0])
-
-        now_ts = int(time())
-        rows = cur.execute("SELECT code, created_at FROM files").fetchall()
-
-        for code, ts in rows:
-            if now_ts - ts > delay:
-                cur.execute("DELETE FROM files WHERE code=?", (code,))
-                db.commit()
-
-        await asyncio.sleep(30)
-
-
-# ---------------------------------------------------------
-# POST INIT
-# ---------------------------------------------------------
-
-async def post_init(app):
-    cur.execute("INSERT OR IGNORE INTO meta VALUES('auto_delete_enabled','1')")
-    cur.execute("INSERT OR IGNORE INTO meta VALUES('auto_delete_seconds',?)",
-                (AUTO_DELETE,))
-    db.commit()
-
-    asyncio.create_task(auto_delete_loop(app))
-    logger.info("Auto delete loop running.")
-
-
-# ---------------------------------------------------------
+# ===================================================================
 # MAIN
-# ---------------------------------------------------------
+# ===================================================================
 
 def main():
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("filestore", cmd_filestore))
-    app.add_handler(CommandHandler("myfiles", cmd_myfiles))
-    app.add_handler(CommandHandler("setcode", cmd_setcode))
-    app.add_handler(CommandHandler("batch", cmd_batch))
-    app.add_handler(CommandHandler("batchdone", cmd_batchdone))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("adminlist", cmd_adminlist))
-    app.add_handler(CommandHandler("addadmin", cmd_addadmin))
-    app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
 
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
+    app.add_handler(CommandHandler("filestore", filestore))
+    app.add_handler(CommandHandler("myfiles", myfiles))
+    app.add_handler(CommandHandler("setcode", setcode))
 
-    logger.info("🔥 Bot is running...")
+    app.add_handler(CommandHandler("batch", batch))
+    app.add_handler(CommandHandler("batchdone", batchdone))
+
+    app.add_handler(CommandHandler("adminlist", adminlist))
+    app.add_handler(CommandHandler("addadmin", addadmin))
+    app.add_handler(CommandHandler("removeadmin", removeadmin))
+
+    app.add_handler(MessageHandler(filters.ALL, message_handler))
+
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
